@@ -233,6 +233,7 @@ def get_forecast_data(
             forecasts[model]
             .unstack()
             .stack()
+            .dropna()
             .rename("ghi_forecast")
             .rename_axis(["valid_time", "lead_time_h"])
             .reset_index()
