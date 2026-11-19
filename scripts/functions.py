@@ -3,6 +3,7 @@
 import pandas as pd
 import solarpy
 import pvlib
+from urllib.error import HTTPError
 
 # Constants 
 FORECAST_STATION = "06019"
