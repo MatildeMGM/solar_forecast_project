@@ -3,6 +3,7 @@
 import pandas as pd
 import solarpy
 import pvlib
+from urllib.error import HTTPError
 
 # Constants 
 FORECAST_STATION = "06019"
@@ -233,6 +234,7 @@ def get_forecast_data(
             forecasts[model]
             .unstack()
             .stack()
+            .dropna()
             .rename("ghi_forecast")
             .rename_axis(["valid_time", "lead_time_h"])
             .reset_index()
