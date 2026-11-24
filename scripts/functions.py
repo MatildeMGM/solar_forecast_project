@@ -1,6 +1,7 @@
 
 
 import pandas as pd
+import numpy as np
 import solarpy
 import pvlib
 from urllib.error import HTTPError
@@ -8,7 +9,7 @@ from urllib.error import HTTPError
 # Constants 
 FORECAST_STATION = "06019"
 FORECAST_START = "2026-11-09"
-FORECAST_END = "2026-11-11"
+FORECAST_END = None
 FORECAST_LATITUDE = 56.93
 FORECAST_LONGITUDE = 8.6412
 
@@ -108,10 +109,20 @@ def resample_dmi_ghi_hourly(data, min_observations=6):
     """
     if "ghi" not in data.columns:
         raise KeyError("Input data must contain a 'ghi' column.")
+    if not isinstance(min_observations, int) or not 1 <= min_observations <= 6:
+        raise ValueError("min_observations must be an integer between 1 and 6.")
 
     data = data.copy()
     data.index = pd.to_datetime(data.index, utc=True)
     data = data.sort_index()
+
+    if data.index.has_duplicates:
+        raise ValueError("Duplicate measurement timestamps must be resolved before resampling.")
+    if not (data.index == data.index.floor("10min")).all():
+        raise ValueError("Measurements must lie on the 10-minute timestamp grid.")
+    data["ghi"] = pd.to_numeric(data["ghi"], errors="coerce").replace(
+        [np.inf, -np.inf], np.nan
+    )
 
     hourly = data[["ghi"]].resample(
         "1h",
@@ -136,22 +147,6 @@ URL = (
     "https://raw.githubusercontent.com/AdamRJensen/"
     "solar-resource-course-2026/refs/heads/main/forecast-data/"
 )
-
-FORECAST_STATION = "06019"
-FORECAST_START = "2026-11-09"
-FORECAST_END = None  # Uses the current UTC time when the function is called
-
-FORECAST_MODELS = [
-    "dmi_harmonie_arome_europe",
-    "metno_nordic",
-    "ecmwf_ifs025",
-    "ecmwf_aifs025_single",
-    "gfs_global",
-    "ecmwf_ifs",
-    "dmi_seamless",
-    "gfs_seamless",
-]
-
 
 def get_forecast_data(
     hourly_measurements,
@@ -198,8 +193,10 @@ def get_forecast_data(
                 index_col=0,
                 parse_dates=[0],
             )
-        except HTTPError:
-            continue
+        except HTTPError as exc:
+            if exc.code == 404:
+                continue
+            raise
 
         forecast.index = pd.to_datetime(forecast.index, utc=True)
         forecast.index.name = "valid_time"
@@ -219,12 +216,16 @@ def get_forecast_data(
 
         forecast_frames.append(forecast)
 
+    if not forecast_frames:
+        raise ValueError(f"No forecast files found for station {station} between {start} and {end}.")
     forecasts = pd.concat(forecast_frames).sort_index()
 
     # Prepare the hourly measurements for matching
     measurements = hourly_measurements[["ghi_measured"]].copy()
     measurements.index = pd.to_datetime(measurements.index, utc=True)
     measurements.index.name = "valid_time"
+    if measurements.index.has_duplicates:
+        raise ValueError("Hourly measurements must have unique timestamps.")
 
     # Create one matched DataFrame per model
     forecast_data = {}
@@ -232,8 +233,6 @@ def get_forecast_data(
     for model in models:
         model_forecast = (
             forecasts[model]
-            .unstack()
-            .stack()
             .dropna()
             .rename("ghi_forecast")
             .rename_axis(["valid_time", "lead_time_h"])
@@ -268,3 +267,122 @@ def get_forecast_data(
         ]
 
     return forecast_data
+
+
+def calculate_forecast_metrics(forecast_unstacked, hourly_measurements):
+    """Return RMSE, bias, MAE and sample count per model and lead time."""
+    measured = hourly_measurements["ghi_measured"]
+    results = {}
+
+    for model, forecast in forecast_unstacked.items():
+        forecast = forecast.replace([np.inf, -np.inf], np.nan)
+        observations = measured.reindex(forecast.index).replace(
+            [np.inf, -np.inf], np.nan
+        )
+
+        # Subtract the matching observation from every lead-time column.
+        errors = forecast.sub(observations, axis=0)
+
+        scores = pd.DataFrame({
+            "rmse": errors.pow(2).mean().pow(0.5),
+            "bias": errors.mean(),
+            "mae": errors.abs().mean(),
+            "n": errors.count(),
+        })
+        scores.index.name = "lead_time_h"
+
+        # Exclude lead zero: its averaging interval has already ended.
+        results[model] = scores.loc[scores.index >= 1].sort_index()
+
+    return pd.concat(results, names=["model"]).reset_index()
+
+
+def calculate_overall_metrics(scores):
+    rows = []
+
+    for model, group in scores.groupby("model"):
+        group = group.loc[group["n"] > 0]
+        n = group["n"].sum()
+
+        if n == 0:
+            continue
+
+        rows.append({
+            "model": model,
+            "rmse": np.sqrt(
+                (group["rmse"] ** 2 * group["n"]).sum() / n
+            ),
+            "bias": (group["bias"] * group["n"]).sum() / n,
+            "mae": (group["mae"] * group["n"]).sum() / n,
+            "n": n,
+        })
+
+    return pd.DataFrame(rows)
+
+
+
+def our_blended_forecasts(forecast_unstacked, weights):
+    """Blend models with fixed, nonnegative weights summing to one.
+
+    Returns NaN wherever any positively weighted model is missing.
+    """
+    if not weights:
+        raise ValueError("Provide at least one model weight.")
+
+    weight_values = np.asarray(list(weights.values()), dtype=float)
+
+    if (
+        not np.isfinite(weight_values).all()
+        or (weight_values < 0).any()
+        or not np.isclose(weight_values.sum(), 1.0)
+    ):
+        raise ValueError("Weights must be finite, nonnegative and sum to 1.")
+
+    blended = None
+
+    for model, weight in weights.items():
+        if weight == 0:
+            continue
+
+        forecast = forecast_unstacked[model].replace(
+            [np.inf, -np.inf], np.nan
+        )
+
+        contribution = forecast * weight
+
+        blended = (
+            contribution.copy()
+            if blended is None
+            else blended + contribution
+        )
+
+    return blended
+
+
+
+def our_blend_by_lead_time(forecast_unstacked, weight_schedule):
+    """Apply a separate blend to each inclusive lead-time interval."""
+    parts = []
+    used_leads = set()
+
+    for first_hour, last_hour, weights in weight_schedule:
+        if first_hour > last_hour:
+            raise ValueError("Invalid lead-time interval.")
+
+        blended = our_blended_forecasts(forecast_unstacked, weights)
+
+        leads = [
+            lead for lead in blended.columns
+            if first_hour <= lead <= last_hour
+        ]
+
+        if used_leads.intersection(leads):
+            raise ValueError("Lead-time intervals must not overlap.")
+
+        used_leads.update(leads)
+        parts.append(blended.loc[:, leads])
+
+    if not parts:
+        raise ValueError("Provide at least one lead-time interval.")
+
+    return pd.concat(parts, axis=1).sort_index(axis=1)
