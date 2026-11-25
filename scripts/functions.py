@@ -270,18 +270,22 @@ def get_forecast_data(
 
 
 def calculate_forecast_metrics(forecast_unstacked, hourly_measurements):
-    """Return RMSE, bias, MAE and sample count per model and lead time."""
+    """Beregn RMSE, bias, MAE og antal målinger for hver model og prognoselængde.
+
+    Bias beregnes som målt GHI minus prognosticeret GHI.
+    """
     measured = hourly_measurements["ghi_measured"]
     results = {}
 
     for model, forecast in forecast_unstacked.items():
         forecast = forecast.replace([np.inf, -np.inf], np.nan)
+
         observations = measured.reindex(forecast.index).replace(
             [np.inf, -np.inf], np.nan
         )
 
-        # Subtract the matching observation from every lead-time column.
-        errors = forecast.sub(observations, axis=0)
+        # Positiv fejl betyder, at prognosen ligger under målingen.
+        errors = forecast.rsub(observations, axis=0)
 
         scores = pd.DataFrame({
             "rmse": errors.pow(2).mean().pow(0.5),
@@ -289,13 +293,13 @@ def calculate_forecast_metrics(forecast_unstacked, hourly_measurements):
             "mae": errors.abs().mean(),
             "n": errors.count(),
         })
+
         scores.index.name = "lead_time_h"
 
-        # Exclude lead zero: its averaging interval has already ended.
+        # Udelad lead time 0, da den timebaserede måling allerede er afsluttet.
         results[model] = scores.loc[scores.index >= 1].sort_index()
 
     return pd.concat(results, names=["model"]).reset_index()
-
 
 def calculate_overall_metrics(scores):
     rows = []
